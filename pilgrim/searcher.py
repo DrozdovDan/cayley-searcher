@@ -7,7 +7,7 @@ from .model import batch_process
 
 
 class Searcher:
-    def __init__(self, model, all_moves, V0, device=None, verbose=0):
+    def __init__(self, model, all_moves, V0, device=None, verbose=0, ban_returns=False):
         self.model = model.to(device)
         self.all_moves = all_moves
         self.V0 = V0
@@ -15,10 +15,12 @@ class Searcher:
         self.n_gens = all_moves.size(0)
         self.state_size = all_moves.size(1)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(42) # For reproducibility of the hash vector
         self.hash_vec = torch.randint(0, int(1e15), (self.state_size,), device=self.device, dtype=torch.int64)
         self.verbose = verbose
         self.counter = torch.zeros((3, 2), dtype=torch.int64)
-    
+        self.ban_returns = ban_returns
+
     def get_unique_states(self, states, states_bad_hashed):
         """Filter unique states by removing duplicates based on hash."""
         idx1 = torch.arange(states.size(0), dtype=torch.int64, device=states.device)
@@ -56,7 +58,7 @@ class Searcher:
             moved_states[i:i+self.batch_size] = torch.gather(states[i:i+self.batch_size], 1, self.all_moves[moves[i:i+self.batch_size]])
         return moved_states
     
-    def do_greedy_step(self, states, states_bad_hashed, B=1000):
+    def do_greedy_step(self, states, states_bad_hashed, states_last_hashed, B=1000):
         """Perform a greedy step to find the best neighbors."""
         idx0 = torch.arange(states.size(0), device=self.device).repeat_interleave(self.n_gens)
         moves = torch.arange(self.n_gens, device=self.device).repeat(states.size(0))
@@ -67,13 +69,16 @@ class Searcher:
             batch_states = states[i:i+self.batch_size]
             neighbors = self.get_neighbors(batch_states).flatten(end_dim=1)
             neighbors_hashed[i*self.n_gens:(i+self.batch_size)*self.n_gens] = state2hash(neighbors, self.hash_vec, self.batch_size)
-        idx1 = self.get_unique_hashed_states_idx(neighbors_hashed, states_bad_hashed)
+        idx1 = self.get_unique_hashed_states_idx(neighbors_hashed, states_bad_hashed if not self.ban_returns else torch.cat((states_bad_hashed, states_last_hashed)))
         self.counter[1, 0] += idx1.size(0); self.counter[1, 1] += 1;
         
         value = torch.empty(idx1.size(0), dtype=torch.float16, device=self.device)
         for i in range(0, idx1.size(0), self.batch_size):
             batch_states = self.apply_move(states[idx0[idx1[i:i+self.batch_size]]], moves[idx1[i:i+self.batch_size]])
             value[i:i+self.batch_size] = self.pred_d(batch_states)[0]
+            # Set value to -inf for states that are the target to avoid missing the solution when it is found due to the bad heuristic estimation
+            if (batch_states == self.V0).all(dim=1).any():
+                    value[i:i+self.batch_size][(batch_states == self.V0).all(dim=1)] = -torch.inf
         idx2 = torch.argsort(value)[:B]
         self.counter[2, 0] += idx2.size(0); self.counter[2, 1] += 1;
         
@@ -93,19 +98,48 @@ class Searcher:
     def get_solution(self, state, B=2**12, num_steps=200, num_attempts=10, return_tree=False):
         """Main solution-finding loop that attempts to solve the cube."""
         states_bad_hashed = torch.tensor([], dtype=torch.int64, device=self.device)
+        tree_move = -torch.ones((num_steps, B), dtype=torch.int64)
+        tree_idx = -torch.ones((num_steps, B), dtype=torch.int64)
         for J in range(num_attempts):
             states = state.unsqueeze(0).clone()
-            tree_move = -torch.ones((num_steps, B), dtype=torch.int64)
-            tree_idx = -torch.ones((num_steps, B), dtype=torch.int64)
-#             tree_value = -torch.ones((num_steps, B), dtype=torch.int64)
-            states_hash_log = deque(maxlen=4)
+            states_hash_log = deque(maxlen=20 if self.ban_returns else 4)
+
+            if self.ban_returns:
+                states_last_hashed = torch.tensor([], dtype=torch.int64, device=self.device)
+
+                states_hash_log_last = deque(maxlen=10)
+
+                states_hash_log_last.append(state2hash(states, self.hash_vec))
+
+            states_hash_log.append(state2hash(states, self.hash_vec))
+
+            start_j = 0
+
+            if J > 0:
+                for j in range(num_steps):
+                    new_states = self.apply_move(states[tree_idx[j]], tree_move[j])
+                    if torch.isin(state2hash(new_states, hash_vec=self.hash_vec), states_bad_hashed).any().item():
+                        start_j = j
+                        break
+                    else:
+                        states = new_states
+                        states_hash_log_last.append(state2hash(states, self.hash_vec))
+                        states_hash_log.append(state2hash(states, self.hash_vec))
             
             if self.verbose:
                 pbar = tqdm(range(num_steps))
             else:
                 pbar = range(num_steps)
             for j in pbar:
-                states, y_pred, moves, idx = self.do_greedy_step(states, states_bad_hashed, B)
+                states, y_pred, moves, idx, next_hashes = self.do_greedy_step(states, states_bad_hashed, states_last_hashed if self.ban_returns else None, B)
+                if states is None:
+                    states_bad_hashed = torch.concat((states_bad_hashed, torch.concat(list(states_hash_log))))
+                    states_bad_hashed = torch.unique(states_bad_hashed)
+                    break
+                if self.ban_returns:
+                    states_hash_log_last.append(next_hashes)
+                    states_last_hashed = torch.cat(list(states_hash_log_last))
+                    states_last_hashed = torch.unique(states_last_hashed)
                 if self.verbose:
                     pbar.set_description(
                         f"  y_min = {y_pred.min().item():.1f}, y_mean = {y_pred.mean().item():.1f}, y_max = {y_pred.max().item():.1f}"

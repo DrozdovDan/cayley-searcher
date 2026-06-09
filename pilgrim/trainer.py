@@ -11,10 +11,9 @@ class Trainer:
                  batch_size=10000, lr=0.001, name="", K_min=1, K_max=55, 
                  all_moves=None, inverse_moves=None, V0=None, 
                  optimizer='Adam', # Adam or AdamSF
-                 α=0.001, # Not supported for this branch
+                 use_consistent_walks=False,
                 ):
         self.net = net.to(device)
-        self.α = α
         self.lr = lr
         self.device = device
         self.num_epochs = num_epochs
@@ -28,12 +27,13 @@ class Trainer:
         self.name = name
         self.K_min = K_min
         self.K_max = K_max
-        self.walkers_num = 1_000_000 // self.K_max
+        self.walkers_num = 1_000_000 // (self.K_max - self.K_min + 1)
         self.all_moves = all_moves
         self.n_gens = all_moves.size(0)
         self.state_size = all_moves.size(1)
         self.inverse_moves = inverse_moves
         self.V0 = V0
+        self.use_consistent_walks = use_consistent_walks
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.weights_dir, exist_ok=True)
 
@@ -55,6 +55,47 @@ class Trainer:
             cutoff = 0 if t < K_min else k * (t - K_min + 1)
             if cutoff < total:
                 states[cutoff:], last_moves[cutoff:] = self.do_random_step(states[cutoff:], last_moves[cutoff:])
+            else:
+                break
+        perm = torch.randperm(total, device=self.device)
+        return states[perm], Y[perm]
+
+    def do_consistent_random_step(self, states, last_moves, states_hashed):
+        """Perform a random step while avoiding inverse moves."""
+        possible_moves = torch.ones((states.size(0), self.n_gens), dtype=torch.bool, device=self.device)
+        if last_moves.sum() >= 0:
+            possible_moves[torch.arange(states.size(0)), self.inverse_moves[last_moves]] = False
+        next_moves = torch.multinomial(possible_moves.float(), 1).squeeze()
+        new_states = torch.gather(states, 1, self.all_moves[next_moves])
+        new_states_hashed = state2hash(new_states, self.hash_vec, self.batch_size)
+        bad_states = torch.isin(new_states_hashed, states_hashed)
+        bad_states_exists = bad_states.any().item()
+        while bad_states_exists:
+            possible_moves[torch.arange(states.size(0)), self.inverse_moves[last_moves] * (1 - bad_states.int()) + next_moves * bad_states.int()] = False
+            if not possible_moves.any(dim=1).all().item():
+                return new_states, next_moves, new_states_hashed, True
+            next_moves = torch.multinomial(possible_moves.float(), 1).squeeze() * bad_states.int() + next_moves * (1 - bad_states.int())
+            new_states = torch.gather(states, 1, self.all_moves[next_moves])
+            new_states_hashed = state2hash(new_states, self.hash_vec, self.batch_size)
+            bad_states = torch.isin(new_states_hashed, states_hashed)
+            bad_states_exists = bad_states.any().item()
+
+        return new_states, next_moves, new_states_hashed, False
+
+    def generate_consistent_random_walks(self, k=1000, K_min=1, K_max=30):
+        """Random walks from K_min to K_max steps with k walkers."""
+        total = k * (K_max - K_min + 1)
+        Y = torch.arange(K_min, K_max + 1, device=self.device).repeat_interleave(k)
+        states = self.V0.repeat(total, 1)
+        states_hashed = state2hash(states, self.hash_vec, self.batch_size)
+        last_moves = torch.full((total,), -1, dtype=torch.int64, device=self.device)
+        regeneration = False
+        for t in range(K_max):
+            cutoff = 0 if t < K_min else k * (t - K_min + 1)
+            if cutoff < total:
+                states[cutoff:], last_moves[cutoff:], states_hashed[cutoff:], regeneration = self.do_consistent_random_step(states[cutoff:], last_moves[cutoff:], states_hashed)
+                if regeneration:
+                    return self.generate_consistent_random_walks(k=k, K_min=K_min, K_max=K_max)
             else:
                 break
         perm = torch.randperm(total, device=self.device)
@@ -85,7 +126,10 @@ class Trainer:
 
             # Data generation
             data_gen_start = time.time()
-            X, Y = self.generate_random_walks(k=self.walkers_num, K_min=self.K_min, K_max=self.K_max)
+            if self.use_consistent_walks:
+                X, Y = self.generate_consistent_random_walks(k=self.walkers_num, K_min=self.K_min, K_max=self.K_max)
+            else:
+                X, Y = self.generate_random_walks(k=self.walkers_num, K_min=self.K_min, K_max=self.K_max)
             data_gen_time = time.time() - data_gen_start
 
             # Training step
@@ -121,3 +165,103 @@ class Trainer:
         # Print final saving information
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
         print(f"[{timestamp}] Finished. Saved final weights at epoch {self.epoch}. Train Loss: {train_loss:.2f}.")
+
+class TrainDataset(torch.utils.data.Dataset):
+    def __init__(self, path):
+        self.X, self.Y = torch.load(path)
+
+    def __len__(self):
+        return self.X.size(0)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+class DatasetTrainer(Trainer):
+    def __init__(self, 
+                 net, num_epochs, device, 
+                 batch_size=10000, lr=0.001, name="", K_min=1, K_max=55, 
+                 all_moves=None, inverse_moves=None, V0=None, 
+                 optimizer='Adam', # Adam or AdamSF
+                 classification=False,
+                 admissibility=False,
+                 *args, **kwargs
+                ):
+        super().__init__(net, num_epochs, device, batch_size, lr, name, K_min, K_max, all_moves, inverse_moves, V0, optimizer)
+
+    def run(self, path):
+        print(f"Starting training using dataset: {path}")
+        self.verbose = True
+        if self.verbose:
+            pbar = trange(self.num_epochs, desc="Training epochs")
+        else:
+            pbar = range(self.num_epochs)
+        self.dataset = TrainDataset(path)
+        self.dataloader = torch.utils.data.DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+        print(f"Dataset size: {len(self.dataset)} samples.")
+        for epoch in pbar:
+            self.epoch += 1
+
+            # Training step
+            epoch_start = time.time()
+            train_loss = self._train_epoch()
+            epoch_time = time.time() - epoch_start
+
+            if self.verbose:
+                pbar.set_postfix({'train_loss': train_loss})
+
+            # Log training data
+            log_file = f"{self.log_dir}/train_{self.name}_{self.id}.csv"
+            log_data = pd.DataFrame([{
+                'epoch': self.epoch, 
+                'train_loss': train_loss, 
+                'val_loss': val_loss if val_path is not None else None,
+                'vertices_seen': len(self.dataset),
+                'data_gen_time': 0,
+                'train_epoch_time': epoch_time
+            }])
+            log_data.to_csv(log_file, mode='a', header=not os.path.exists(log_file), index=False)
+
+            # Save weights on powers of two
+            if (self.epoch & (self.epoch - 1)) == 0:
+                weights_file = f"{self.weights_dir}/{self.name}_{self.id}_e{self.epoch:05d}.pth"
+                torch.save(self.net.state_dict(), weights_file)
+
+                # Print saving information with timestamp and train loss
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                print(f"[{timestamp}] Saved weights at epoch {self.epoch:5d}. Train Loss: {train_loss:.2f}")
+
+        # Save final weights
+        if (self.epoch & (self.epoch - 1)) != 0:
+            final_weights_file = f"{self.weights_dir}/{self.name}_{self.id}_e{self.epoch:05d}.pth"
+            torch.save(self.net.state_dict(), final_weights_file)
+
+        # Print final saving information
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        print(f"[{timestamp}] Finished. Saved final weights at epoch {self.epoch}. Train Loss: {train_loss:.2f}.")
+
+    def _train_epoch(self):
+        self.net.train()
+        avg_loss = 0.0
+        total_batches = len(self.dataset) // self.batch_size
+
+        if self.verbose:
+            iterator = tqdm(self.dataloader, desc="Training batches")
+        else:
+            iterator = self.dataloader
+        
+        for data, target in iterator:
+            data = data.to(self.device)
+            target = target.to(self.device).float()
+            output = self.net(data)
+            loss = self.criterion(output, target)
+            
+            if self.verbose:
+                iterator.set_postfix({'loss': loss.item()})
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            avg_loss += loss.item()
+
+        return avg_loss / total_batches if total_batches > 0 else avg_loss

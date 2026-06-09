@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--shift", type=int, default=0, help="Shift part of the dataset.")
     parser.add_argument("--skip_list", type=str, help="IDs to skip, e.g. '[2, 5]' or '2,5'.")
     parser.add_argument("--return_tree", type=int, default=0, help="Save beam search tree to 'forest' folder.")
+    parser.add_argument("--ban_returns", type=bool, default=False, help="Ban returning to recently visited states.")
 
     args = parser.parse_args()
     args.skip_list = parse_skip_list(args.skip_list)
@@ -87,14 +88,40 @@ def main():
     inverse_moves = torch.tensor(generate_inverse_moves(move_names), dtype=torch.int64, device=device)
 
     # Build model (fixed ReLU + BatchNorm inside Pilgrim; no activation/use_batch_norm args)
-    model = Pilgrim(
-        num_classes=num_classes,
-        state_size=state_size,
-        hd1=info["hd1"],
-        hd2=info["hd2"],
-        nrd=info["nrd"],
-        dropout_rate=info.get("dropout", 0.0),
-    )
+    mode = info.get("mode", "MLP")
+    if mode == "MLP":
+        model = Pilgrim(
+            num_classes=num_classes,
+            state_size=state_size,
+            hd1=info["hd1"],
+            hd2=info["hd2"],
+            nrd=info["nrd"],
+            dropout_rate=info.get("dropout", 0.0),
+        )
+    elif mode == "GNN":
+        model = CayleyStarHeuristicNet(
+            state_dim=state_size,
+            n_gens=n_gens,
+            all_moves=all_moves,
+            num_relations=n_gens,
+            hidden=info.get("hidden", 128),
+            layers=info.get("layers", 3),
+            emb_dim=info.get("embed_dim", 64),
+            num_bases=min(info.get("num_bases", 20), n_gens),
+            num_symbols=V0.max().item() + 1,
+        )
+    elif mode == "SA":
+        model = StateTransformerHeuristic(
+            state_dim=state_size,
+            num_symbols=V0.max().item() + 1,
+            num_layers=info.get("num_layers", 3),
+            d_model=info.get("d_model", 128),
+            nhead=info.get("nhead", 8),
+            dim_feedforward=info.get("dim_feedforward", 512),
+            dropout=info.get("dropout", 0.0),
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     # Load weights
     weights_path = f"weights/p{int(args.group_id):03d}-t{int(args.target_id):03d}_{args.model_id}_e{args.epoch:05d}.pth"
@@ -123,7 +150,7 @@ def main():
     print(f"Test dataset size: {args.tests_num}")
 
     # Initialize searcher
-    searcher = Searcher(model=model, all_moves=all_moves, V0=V0, device=device, verbose=args.verbose)
+    searcher = Searcher(model=model, all_moves=all_moves, V0=V0, device=device, verbose=args.verbose, ban_returns=args.ban_returns)
 
     # Prepare log file path
     log_file_add = ""
